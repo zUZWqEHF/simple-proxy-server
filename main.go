@@ -375,11 +375,18 @@ const (
 	muxCmdConnectFail = 0x03
 	muxCmdData        = 0x04
 	muxCmdFIN         = 0x05
+	muxCmdUDPData     = 0x06
 )
 
 type muxStream struct {
 	id     uint32
 	remote net.Conn
+}
+
+// udpSession tracks a NAT-ed UDP "connection" for relay.
+type udpSession struct {
+	conn     *net.UDPConn
+	lastUsed time.Time
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +401,7 @@ type muxStream struct {
 //   0x03 CONNECT_FAIL S→C  payload = UTF-8 error string
 //   0x04 DATA         both payload = raw data
 //   0x05 FIN          both payload = empty (half-close)
+//   0x06 UDP_DATA     both payload = [addrType 1B] [addr...] [port 2B] [data...]
 // ---------------------------------------------------------------------------
 
 func handleMux(conn net.Conn, c2sAEAD, s2cAEAD cipher.AEAD, prefix []byte, remoteAddr string) {
@@ -402,7 +410,13 @@ func handleMux(conn net.Conn, c2sAEAD, s2cAEAD cipher.AEAD, prefix []byte, remot
 
 	streams := make(map[uint32]*muxStream)
 	var streamsMu sync.Mutex
+
+	// UDP session cache: key = "dstIP:dstPort"
+	udpSessions := make(map[string]*udpSession)
+	var udpMu sync.Mutex
+
 	var wg sync.WaitGroup
+	done := make(chan struct{})
 
 	safeWriteFrame := func(data []byte) error {
 		writeMu.Lock()
@@ -424,7 +438,7 @@ func handleMux(conn net.Conn, c2sAEAD, s2cAEAD cipher.AEAD, prefix []byte, remot
 		return safeWriteFrame(frame)
 	}
 
-	// Relay: remote target → encrypted client
+	// Relay: remote target → encrypted client (TCP)
 	startRemoteReader := func(s *muxStream) {
 		defer wg.Done()
 		buf := make([]byte, 16384)
@@ -442,6 +456,66 @@ func handleMux(conn net.Conn, c2sAEAD, s2cAEAD cipher.AEAD, prefix []byte, remot
 		}
 		_ = sendMux(muxCmdFIN, s.id, nil)
 	}
+
+	// Relay: remote UDP target → encrypted client
+	startUdpReader := func(key string, sess *udpSession) {
+		defer wg.Done()
+		buf := make([]byte, 65536)
+		for {
+			sess.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			n, srcAddr, err := sess.conn.ReadFromUDP(buf)
+			if err != nil {
+				debugf("[%s] udp reader %s done: %v", remoteAddr, key, err)
+				break
+			}
+			if n <= 0 {
+				continue
+			}
+			sess.lastUsed = time.Now()
+
+			// Build response: [addrType=1] [4B IP] [2B port] [data...]
+			ip4 := srcAddr.IP.To4()
+			if ip4 == nil {
+				continue // skip IPv6 for now
+			}
+			resp := make([]byte, 1+4+2+n)
+			resp[0] = 0x01 // IPv4
+			copy(resp[1:5], ip4)
+			binary.BigEndian.PutUint16(resp[5:7], uint16(srcAddr.Port))
+			copy(resp[7:], buf[:n])
+
+			if werr := sendMux(muxCmdUDPData, 0, resp); werr != nil {
+				break
+			}
+		}
+		// Clean up
+		udpMu.Lock()
+		delete(udpSessions, key)
+		udpMu.Unlock()
+		sess.conn.Close()
+	}
+
+	// Periodically clean up idle UDP sessions
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				udpMu.Lock()
+				now := time.Now()
+				for k, s := range udpSessions {
+					if now.Sub(s.lastUsed) > 30*time.Second {
+						s.conn.Close()
+						delete(udpSessions, k)
+					}
+				}
+				udpMu.Unlock()
+			}
+		}
+	}()
 
 	log.Printf("[%s] mux session started", remoteAddr)
 
@@ -471,8 +545,6 @@ func handleMux(conn net.Conn, c2sAEAD, s2cAEAD cipher.AEAD, prefix []byte, remot
 				continue
 			}
 			// Dial asynchronously to prevent head-of-line blocking.
-			// A slow dial (e.g. unreachable host) must not block the
-			// read loop, otherwise ALL mux streams stall.
 			wg.Add(1)
 			go func(sid uint32, addr string) {
 				defer wg.Done()
@@ -520,15 +592,86 @@ func handleMux(conn net.Conn, c2sAEAD, s2cAEAD cipher.AEAD, prefix []byte, remot
 					_ = tcp.CloseWrite()
 				}
 			}
+
+		case muxCmdUDPData:
+			// UDP relay: [addrType 1B] [addr...] [port 2B] [data...]
+			if len(payload) < 8 {
+				continue
+			}
+			addrType := payload[0]
+			var dstIP net.IP
+			var dstPort uint16
+			var udpPayload []byte
+
+			switch addrType {
+			case 0x01: // IPv4
+				if len(payload) < 7 {
+					continue
+				}
+				dstIP = net.IP(payload[1:5])
+				dstPort = binary.BigEndian.Uint16(payload[5:7])
+				udpPayload = payload[7:]
+			case 0x03: // Domain
+				dlen := int(payload[1])
+				if len(payload) < 2+dlen+2 {
+					continue
+				}
+				domain := string(payload[2 : 2+dlen])
+				dstPort = binary.BigEndian.Uint16(payload[2+dlen : 4+dlen])
+				udpPayload = payload[4+dlen:]
+				ips, err := net.ResolveIPAddr("ip4", domain)
+				if err != nil {
+					debugf("[%s] UDP DNS resolve failed for %s: %v", remoteAddr, domain, err)
+					continue
+				}
+				dstIP = ips.IP
+			default:
+				continue
+			}
+
+			key := fmt.Sprintf("%s:%d", dstIP, dstPort)
+			udpMu.Lock()
+			sess, exists := udpSessions[key]
+			if !exists {
+				// Create new UDP connection
+				udpAddr := &net.UDPAddr{IP: dstIP, Port: int(dstPort)}
+				udpConn, err := net.DialUDP("udp", nil, udpAddr)
+				if err != nil {
+					udpMu.Unlock()
+					debugf("[%s] UDP dial failed %s: %v", remoteAddr, key, err)
+					continue
+				}
+				sess = &udpSession{conn: udpConn, lastUsed: time.Now()}
+				udpSessions[key] = sess
+				wg.Add(1)
+				go startUdpReader(key, sess)
+				debugf("[%s] new UDP session → %s", remoteAddr, key)
+			}
+			udpMu.Unlock()
+
+			sess.lastUsed = time.Now()
+			if _, err := sess.conn.Write(udpPayload); err != nil {
+				debugf("[%s] UDP write to %s failed: %v", remoteAddr, key, err)
+			}
 		}
 	}
 
-	// Cleanup: close all streams
+	// Signal cleanup
+	close(done)
+
+	// Cleanup: close all TCP streams
 	streamsMu.Lock()
 	for _, s := range streams {
 		s.remote.Close()
 	}
 	streamsMu.Unlock()
+
+	// Cleanup: close all UDP sessions
+	udpMu.Lock()
+	for _, s := range udpSessions {
+		s.conn.Close()
+	}
+	udpMu.Unlock()
 
 	wg.Wait()
 	log.Printf("[%s] mux session ended", remoteAddr)
